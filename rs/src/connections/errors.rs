@@ -22,10 +22,15 @@ pub enum TunnelError {
     InvalidHostEndpoint(String),
 
     #[error("websocket error: {0}")]
-    WebSocketError(#[from] tungstenite::Error),
+    WebSocketError(#[from] tokio_tungstenite::tungstenite::error::Error),
 
     #[error("port {0} already exists in the relay")]
     PortAlreadyExists(u32),
+
+    #[error("max reconnect attempts ({0}) exceeded")]
+    MaxReconnectAttemptsExceeded(u32),
+    #[error("tunnel access token refresh failed")]
+    TokenRefreshFailed,
 
     #[error("proxy connection failed: {0}")]
     ProxyConnectionFailed(std::io::Error),
@@ -38,4 +43,10 @@ pub enum TunnelError {
 
     #[error("proxy connect request failed: {0}")]
     ProxyConnectRequestFailed(hyper::Error),
+
+    #[error("no tunnel endpoint has a client relay URI")]
+    MissingClientEndpoint,
+
+    #[error("error listening on address: {0}")]
+    ErrorListeningOnAddress(std::io::Error),
 }

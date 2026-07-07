@@ -12,15 +12,16 @@ use std::{
 };
 
 use crate::{
-    contracts::{TunnelConnectionMode, TunnelEndpoint, TunnelPort, TunnelRelayTunnelEndpoint},
+    contracts::{TunnelConnectionMode, TunnelEndpoint, TunnelPort},
     management::{
         Authorization, HttpError, TunnelLocator, TunnelManagementClient, TunnelRequestOptions,
         NO_REQUEST_OPTIONS,
     },
 };
 use async_trait::async_trait;
-use futures::{stream::FuturesUnordered, StreamExt, TryFutureExt};
+use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use russh::{server::Server as ServerTrait, CryptoVec};
+use russh_keys::PublicKeyBase64;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
@@ -38,6 +39,93 @@ use super::{
 /// Mapping of port numbers to senders to which new port connections should be
 /// sent. Shared by the host relay to each connected session.
 type PortMap = HashMap<u32, mpsc::UnboundedSender<ForwardedPortConnection>>;
+
+// @group Reconnection : Types for automatic reconnection with exponential backoff
+
+/// The connection state of a persistent relay host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayConnectionState {
+    /// Actively connected to the relay.
+    Connected,
+    /// Connection was lost; waiting before the next reconnect attempt.
+    Reconnecting {
+        /// 1-based attempt counter.
+        attempt: u32,
+        /// Milliseconds until the next connection attempt.
+        delay_ms: u64,
+    },
+    /// Permanently disconnected (clean shutdown or max retries exceeded).
+    Disconnected,
+}
+
+/// Observable state of the SSH keep-alive probing for a [`PersistentRelayHandle`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeepAliveState {
+    /// Keep-alive is not configured (default).
+    NotConfigured,
+    /// The most recent keep-alive probe succeeded.
+    Succeeded {
+        /// Number of successful probes so far.
+        count: u32,
+    },
+    /// The most recent keep-alive probe failed or timed out.
+    Failed {
+        /// Number of failed probes so far.
+        count: u32,
+    },
+}
+
+/// Controls the back-off behaviour of [`RelayTunnelHost::connect_persistent`].
+pub struct ReconnectOptions {
+    /// Maximum number of reconnect attempts before giving up.
+    /// `None` (default) retries indefinitely.
+    pub max_attempts: Option<u32>,
+    /// Delay before the first retry, in milliseconds. Default: 1 000 ms.
+    pub initial_delay_ms: u64,
+    /// Upper bound on retry delay, in milliseconds. Default: 13 000 ms.
+    pub max_delay_ms: u64,
+    /// Interval between SSH keep-alive probes. `None` (default) disables keep-alive
+    /// (WebSocket-level pings still run regardless).
+    pub keep_alive_interval: Option<Duration>,
+    /// Async callback invoked when the access token is rejected (HTTP 401).
+    /// Should return a fresh token, or `None` if a new token cannot be obtained.
+    /// When `None` (default), unauthorized errors follow normal back-off.
+    pub token_refresher: Option<Arc<dyn Fn() -> BoxFuture<'static, Option<String>> + Send + Sync>>,
+}
+
+impl Default for ReconnectOptions {
+    fn default() -> Self {
+        Self {
+            max_attempts: None,
+            initial_delay_ms: 1_000,
+            max_delay_ms: 13_000,
+            keep_alive_interval: None,
+            token_refresher: None,
+        }
+    }
+}
+
+/// Handle returned by [`RelayTunnelHost::connect_persistent`].
+///
+/// Drop this value (or call [`PersistentRelayHandle::stop`]) to request a
+/// clean shutdown of the reconnect loop.
+pub struct PersistentRelayHandle {
+    /// Observe connection-state changes as they happen.
+    pub state: watch::Receiver<RelayConnectionState>,
+    /// Observe keep-alive probe state changes as they happen.
+    pub keep_alive: watch::Receiver<KeepAliveState>,
+    /// Dropping this sender signals the reconnect loop to exit.
+    _stop_tx: mpsc::Sender<()>,
+    join: JoinHandle<Result<(), TunnelError>>,
+}
+
+impl PersistentRelayHandle {
+    /// Signals the reconnect loop to stop and waits for a clean exit.
+    pub async fn stop(self) -> Result<(), TunnelError> {
+        drop(self._stop_tx);
+        self.join.await.unwrap_or(Ok(()))
+    }
+}
 
 /// The RelayTunnelHost can host connections via the tunneling service. After
 /// creating it, you will generally want to run `connect()` to create a new
@@ -128,7 +216,6 @@ pub struct RelayTunnelHost {
 /// Ports are handled by a client calling `add_port()` or `add_port_raw()`,
 /// which either forward to a local TCP connection or return the
 /// ForwardedPortConnection directly, respectively.
-
 #[allow(dead_code)]
 impl RelayTunnelHost {
     pub fn new(locator: TunnelLocator, mgmt: TunnelManagementClient) -> Self {
@@ -172,65 +259,201 @@ impl RelayTunnelHost {
     /// reconnect if this happens, and they can reconnect using the same
     /// RelayTunnelHost.
     pub async fn connect(&mut self, host_token: &str) -> Result<RelayHandle, TunnelError> {
-        let (cnx, endpoint) = self.create_websocket(host_token).await?;
-        let cnx = AsyncRWWebSocket::new(super::ws::AsyncRWWebSocketOptions {
-            websocket: cnx,
-            ping_interval: Duration::from_secs(60),
-            ping_timeout: Duration::from_secs(10),
-        });
+        relay_connect_once(
+            &self.mgmt,
+            &self.locator,
+            self.host_id,
+            &self.proxy,
+            self.host_keypair.clone(),
+            self.ports_rx.clone(),
+            host_token,
+            None, // keep-alive not configured for single connect
+        )
+        .await
+    }
 
-        let (client_session, mut rx) = RelayTunnelHost::make_ssh_client(cnx)
-            .await
-            .map_err(TunnelError::TunnelRelayDisconnected)?;
-        let client_session = Arc::new(client_session);
-        let client_session_ret = client_session.clone();
+    /// Connects to the relay and automatically reconnects on disconnection.
+    ///
+    /// Unlike [`connect`], this method retries indefinitely (or up to
+    /// `options.max_attempts` times) with exponential back-off.
+    ///
+    /// The first connection attempt is made eagerly so callers surface
+    /// configuration errors immediately. Drop the returned
+    /// [`PersistentRelayHandle`] (or call [`PersistentRelayHandle::stop`]) to
+    /// request a clean shutdown.
+    // @group Reconnection : Persistent connection with automatic exponential backoff
+    pub async fn connect_persistent(
+        &mut self,
+        host_token: String,
+        options: ReconnectOptions,
+    ) -> Result<PersistentRelayHandle, TunnelError> {
+        // Fail-fast: establish the first connection eagerly.
+        let (ka_tx, ka_rx) = watch::channel(KeepAliveState::NotConfigured);
+        let ka_tx_arc = Arc::new(ka_tx);
 
-        log::debug!("established host relay primary session");
+        let initial_handle = relay_connect_once(
+            &self.mgmt,
+            &self.locator,
+            self.host_id,
+            &self.proxy,
+            self.host_keypair.clone(),
+            self.ports_rx.clone(),
+            &host_token,
+            options.keep_alive_interval.map(|d| (d, ka_tx_arc.clone())),
+        )
+        .await?;
 
-        let mut channels = HashMap::new();
-        let ports_rx = self.ports_rx.clone();
+        let (state_tx, state_rx) = watch::channel(RelayConnectionState::Connected);
+        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+
+        let mgmt = self.mgmt.clone();
+        let locator = self.locator.clone();
+        let host_id = self.host_id;
+        let proxy = self.proxy.clone();
         let host_keypair = self.host_keypair.clone();
+        let ports_rx = self.ports_rx.clone();
+
         let join = tokio::spawn(async move {
-            let mut server = RelayTunnelHost::make_ssh_server(host_keypair.clone());
-            loop {
+            let mut current_join = initial_handle.join;
+            let mut delay_ms = options.initial_delay_ms;
+            // @group Reconnection > Token Refresh : Track single-attempt token refresh per session
+            let mut current_host_token = host_token;
+
+            'reconnect: loop {
+                // Wait for the current connection to finish or a stop signal.
                 tokio::select! {
-                    Some(op) = rx.recv() => match op {
-                        ChannelOp::Open(id) => {
-                            let (rw, sender) = AsyncRWChannel::new(id, client_session.clone());
-                            server.run_stream(rw, ports_rx.clone());
-                            // do we need to store the JoinHandle for any reason?
-                            channels.insert(id, sender);
-                            log::info!("Opened new client on channel {}", id);
-                        },
-                        ChannelOp::Close(id) => {
-                            channels.remove(&id);
-                        },
-                        ChannelOp::Data(id, data) => {
-                            if let Some(ch) = channels.get(&id) {
-                                if ch.send(data).is_err() { // rx was dropped
-                                    channels.remove(&id);
+                    r = &mut current_join => {
+                        match r {
+                            Ok(Ok(())) => log::debug!("relay connection ended cleanly"),
+                            Ok(Err(e)) => log::warn!("relay connection ended with error: {}", e),
+                            Err(_) => log::warn!("relay task panicked"),
+                        }
+                    }
+                    _ = stop_rx.recv() => {
+                        current_join.abort();
+                        let _ = current_join.await;
+                        break 'reconnect;
+                    }
+                }
+
+                // Reconnect inner loop: retry with exponential back-off.
+                let mut attempt: u32 = 0;
+                // @group Reconnection > SSH-level Reconnection : Skip delay after SSH protocol failures
+                let mut skip_delay = false;
+                // @group Reconnection > Token Refresh : Single refresh per reconnect session
+                let mut token_refreshed = false;
+                loop {
+                    attempt += 1;
+                    if let Some(max) = options.max_attempts {
+                        if attempt > max {
+                            let _ = state_tx.send(RelayConnectionState::Disconnected);
+                            return Err(TunnelError::MaxReconnectAttemptsExceeded(max));
+                        }
+                    }
+
+                    let effective_delay = if skip_delay { 0 } else { delay_ms };
+                    skip_delay = false;
+                    let _ = state_tx.send(RelayConnectionState::Reconnecting {
+                        attempt,
+                        delay_ms: effective_delay,
+                    });
+
+                    if effective_delay > 0 {
+                        log::info!(
+                            "waiting {}ms before reconnect attempt {}",
+                            effective_delay, attempt
+                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(effective_delay)) => {}
+                            _ = stop_rx.recv() => { break 'reconnect; }
+                        }
+                    }
+
+                    delay_ms = (delay_ms * 2).min(options.max_delay_ms);
+
+                    match relay_connect_once(
+                        &mgmt,
+                        &locator,
+                        host_id,
+                        &proxy,
+                        host_keypair.clone(),
+                        ports_rx.clone(),
+                        &current_host_token,
+                        options.keep_alive_interval.map(|d| (d, ka_tx_arc.clone())),
+                    )
+                    .await
+                    {
+                        Ok(handle) => {
+                            log::info!("reconnected to relay on attempt {}", attempt);
+                            let _ = state_tx.send(RelayConnectionState::Connected);
+                            current_join = handle.join;
+                            delay_ms = options.initial_delay_ms;
+                            break; // exit inner loop, wait for new connection
+                        }
+                        // @group Reconnection > SSH-level Reconnection : SSH error, retry once immediately
+                        Err(TunnelError::TunnelRelayDisconnected(_)) => {
+                            log::warn!(
+                                "SSH-level failure on attempt {}, retrying immediately",
+                                attempt
+                            );
+                            delay_ms = options.initial_delay_ms;
+                            skip_delay = true;
+                        }
+                        // @group Reconnection > Token Refresh : HTTP 401, call token_refresher
+                        Err(TunnelError::HttpError {
+                            error: HttpError::ResponseError(ref resp_err),
+                            ..
+                        }) if resp_err.status_code == reqwest::StatusCode::UNAUTHORIZED => {
+                            if let Some(refresher) = &options.token_refresher {
+                                if !token_refreshed {
+                                    log::info!(
+                                        "access token rejected (HTTP 401), refreshing"
+                                    );
+                                    match refresher().await {
+                                        Some(new_token) => {
+                                            current_host_token = new_token;
+                                            token_refreshed = true;
+                                            skip_delay = true;
+                                        }
+                                        None => {
+                                            log::warn!("token refresher returned None");
+                                            let _ = state_tx.send(
+                                                RelayConnectionState::Disconnected,
+                                            );
+                                            return Err(TunnelError::TokenRefreshFailed);
+                                        }
+                                    }
+                                } else {
+                                    log::warn!("still unauthorized after token refresh");
+                                    let _ = state_tx.send(
+                                        RelayConnectionState::Disconnected,
+                                    );
+                                    return Err(TunnelError::TokenRefreshFailed);
                                 }
+                            } else {
+                                log::warn!(
+                                    "reconnect attempt {} failed: unauthorized (no token refresher)",
+                                    attempt
+                                );
                             }
-                        },
-                    },
-                    else => break,
+                        }
+                        Err(e) => {
+                            log::warn!("reconnect attempt {} failed: {}", attempt, e);
+                            // loop continues with next attempt
+                        }
+                    }
                 }
             }
 
-            client_session
-                .disconnect(russh::Disconnect::ByApplication, "going away", "en")
-                .await
-                .ok();
-
-            log::debug!("disconnected primary session after EOF");
-
+            let _ = state_tx.send(RelayConnectionState::Disconnected);
             Ok(())
         });
 
-        Ok(RelayHandle {
-            endpoint,
+        Ok(PersistentRelayHandle {
+            state: state_rx,
+            keep_alive: ka_rx,
+            _stop_tx: stop_tx,
             join,
-            session: client_session_ret,
         })
     }
 
@@ -321,10 +544,13 @@ impl RelayTunnelHost {
     }
 
     fn make_ssh_server(keypair: russh_keys::key::KeyPair) -> Server {
+        let keypair_sha2_256 = keypair
+            .with_signature_hash(russh_keys::key::SignatureHash::SHA2_256)
+            .unwrap_or_else(|| keypair.clone());
         let c = russh::server::Config {
             connection_timeout: None,
             auth_rejection_time: std::time::Duration::from_secs(5),
-            keys: vec![keypair],
+            keys: vec![keypair_sha2_256, keypair],
             window_size: 1024 * 1024,
             preferred: russh::Preferred::COMPRESSED,
             limits: russh::Limits {
@@ -337,6 +563,10 @@ impl RelayTunnelHost {
 
         let config = Arc::new(c);
         Server { config }
+    }
+
+    fn host_public_keys_for_endpoint(&self) -> Vec<String> {
+        encode_host_public_keys(&self.host_keypair)
     }
 
     async fn make_ssh_client(
@@ -372,70 +602,183 @@ impl RelayTunnelHost {
 
         Ok((session, rx))
     }
+}
 
-    async fn create_websocket(
-        &self,
-        host_token: &str,
-    ) -> Result<
-        (
-            WebSocketStream<MaybeTlsStream<TcpStream>>,
-            TunnelRelayTunnelEndpoint,
-        ),
-        TunnelError,
-    > {
-        let endpoint = self
-            .mgmt
-            .update_tunnel_relay_endpoints(
-                &self.locator,
-                &TunnelRelayTunnelEndpoint {
-                    base: TunnelEndpoint {
-                        id: Some(format!("{}-relay", self.host_id)),
-                        connection_mode: TunnelConnectionMode::TunnelRelay,
-                        host_id: self.host_id.to_string(),
-                        host_public_keys: vec![],
-                        port_uri_format: None,
-                        port_ssh_command_format: None,
-                        ssh_gateway_public_key: None,
-                        tunnel_ssh_command: None,
-                        tunnel_uri: None,
-                    },
-                    client_relay_uri: None,
-                    host_relay_uri: None,
+// @group Reconnection : Free helper functions backing connect() and connect_persistent()
+
+async fn create_relay_websocket(
+    mgmt: &TunnelManagementClient,
+    locator: &TunnelLocator,
+    host_id: Uuid,
+    proxy: &Option<String>,
+    host_token: &str,
+) -> Result<
+    (
+        WebSocketStream<MaybeTlsStream<TcpStream>>,
+        TunnelRelayTunnelEndpoint,
+    ),
+    TunnelError,
+> {
+    let endpoint = mgmt
+        .update_tunnel_relay_endpoints(
+            locator,
+            &TunnelRelayTunnelEndpoint {
+                base: TunnelEndpoint {
+                    id: Some(format!("{}-relay", host_id)),
+                    connection_mode: TunnelConnectionMode::TunnelRelay,
+                    host_id: host_id.to_string(),
+                    host_public_keys: vec![],
+                    port_uri_format: None,
+                    port_ssh_command_format: None,
+                    ssh_gateway_public_key: None,
+                    tunnel_ssh_command: None,
+                    tunnel_uri: None,
                 },
-                &TunnelRequestOptions {
-                    authorization: Some(Authorization::Tunnel(host_token.to_string())),
-                    ..TunnelRequestOptions::default()
-                },
-            )
-            .await
-            .map_err(|e| TunnelError::HttpError {
-                error: e,
-                reason: "failed to update tunnel endpoint for hosting",
-            })?;
+                client_relay_uri: None,
+                host_relay_uri: None,
+            },
+            &TunnelRequestOptions {
+                authorization: Some(Authorization::Tunnel(host_token.to_string())),
+                ..TunnelRequestOptions::default()
+            },
+        )
+        .await
+        .map_err(|e| TunnelError::HttpError {
+            error: e,
+            reason: "failed to update tunnel endpoint for hosting",
+        })?;
 
-        let url = endpoint
-            .host_relay_uri
-            .as_deref()
-            .ok_or(TunnelError::MissingHostEndpoint)?;
+    let url = endpoint
+        .host_relay_uri
+        .as_deref()
+        .ok_or(TunnelError::MissingHostEndpoint)?;
 
-        let req = build_websocket_request(
-            url,
-            &[
-                ("Sec-WebSocket-Protocol", "tunnel-relay-host"),
-                ("Authorization", &format!("tunnel {}", host_token)),
-                ("User-Agent", self.mgmt.user_agent.to_str().unwrap()),
-            ],
-        )?;
+    let req = build_websocket_request(
+        url,
+        &[
+            ("Sec-WebSocket-Protocol", "tunnel-relay-host"),
+            ("Authorization", &format!("tunnel {}", host_token)),
+            ("User-Agent", mgmt.user_agent.to_str().unwrap()),
+        ],
+    )?;
 
-        let cnx = if let Some(proxy) = &self.proxy {
-            log::debug!("connecting via http_proxy on {}", proxy);
-            connect_via_proxy(req, proxy).await?
-        } else {
-            connect_directly(req).await?
-        };
+    let cnx = if let Some(proxy) = proxy {
+        log::debug!("connecting via http_proxy on {}", proxy);
+        connect_via_proxy(req, proxy).await?
+    } else {
+        connect_directly(req).await?
+    };
 
-        Ok((cnx, endpoint))
+    Ok((cnx, endpoint))
+}
+
+async fn relay_connect_once(
+    mgmt: &TunnelManagementClient,
+    locator: &TunnelLocator,
+    host_id: Uuid,
+    proxy: &Option<String>,
+    host_keypair: russh_keys::key::KeyPair,
+    ports_rx: watch::Receiver<PortMap>,
+    host_token: &str,
+    keep_alive: Option<(Duration, Arc<watch::Sender<KeepAliveState>>)>,
+) -> Result<RelayHandle, TunnelError> {
+    let (cnx, endpoint) =
+        create_relay_websocket(mgmt, locator, host_id, proxy, host_token).await?;
+    let cnx = AsyncRWWebSocket::new(super::ws::AsyncRWWebSocketOptions {
+        websocket: cnx,
+        ping_interval: Duration::from_secs(60),
+        ping_timeout: Duration::from_secs(10),
+    });
+
+    let (client_session, mut rx) = RelayTunnelHost::make_ssh_client(cnx)
+        .await
+        .map_err(TunnelError::TunnelRelayDisconnected)?;
+    let client_session = Arc::new(client_session);
+    let client_session_ret = client_session.clone();
+
+    // @group SSH Keep-alive : Periodic liveness probe via is_closed()
+    if let Some((interval, ka_tx)) = keep_alive {
+        let ka_tx = ka_tx.clone();
+        let session_check = client_session_ret.clone();
+        tokio::spawn(async move {
+            let mut count: u32 = 0;
+            loop {
+                tokio::time::sleep(interval).await;
+                count = count.saturating_add(1);
+                if session_check.is_closed() {
+                    let _ = ka_tx.send(KeepAliveState::Failed { count });
+                    break;
+                } else {
+                    let _ = ka_tx.send(KeepAliveState::Succeeded { count });
+                }
+            }
+        });
     }
+
+
+    log::debug!("established host relay primary session");
+
+    let mut channels = HashMap::new();
+    let join = tokio::spawn(async move {
+        let mut server = RelayTunnelHost::make_ssh_server(host_keypair.clone());
+        loop {
+            tokio::select! {
+                Some(op) = rx.recv() => match op {
+                    ChannelOp::Open(id) => {
+                        let (rw, sender) = AsyncRWChannel::new(id, client_session.clone());
+                        server.run_stream(rw, ports_rx.clone());
+                        channels.insert(id, sender);
+                        log::info!("Opened new client on channel {}", id);
+                    },
+                    ChannelOp::Close(id) => {
+                        channels.remove(&id);
+                    },
+                    ChannelOp::Data(id, data) => {
+                        if let Some(ch) = channels.get(&id) {
+                            if ch.send(data).is_err() {
+                                channels.remove(&id);
+                            }
+                        }
+                    },
+                },
+                else => break,
+            }
+        }
+
+        client_session
+            .disconnect(russh::Disconnect::ByApplication, "going away", "en")
+            .await
+            .ok();
+
+        log::debug!("disconnected primary session after EOF");
+
+        Ok(())
+    });
+
+    Ok(RelayHandle {
+        endpoint,
+        join,
+        session: client_session_ret,
+    })
+}
+
+/// Encodes the host's public key(s) for advertisement in a TunnelEndpoint.
+///
+/// We use the canonical SSH wire-format encoding of the public key (for RSA,
+/// this is the "ssh-rsa" blob, regardless of which signature-hash variant the
+/// keypair was generated with). This is the same form the russh client
+/// recovers from the server's host key during key exchange and base64-encodes
+/// via `PublicKey::public_key_base64()`, which is what `RelayTunnelClient`
+/// compares against.
+///
+/// Note: `KeyPair::public_key_base64()` is *not* equivalent — for RSA it
+/// includes the hash variant (e.g. "rsa-sha2-256") in the blob, which would
+/// never match what the client sees on the wire.
+fn encode_host_public_keys(keypair: &russh_keys::key::KeyPair) -> Vec<String> {
+    let public_key = keypair
+        .clone_public_key()
+        .expect("expected to clone host public key");
+    vec![public_key.public_key_base64()]
 }
 
 /// Type returned in a channel from `add_forwarded_port_raw`, implementing
@@ -452,8 +795,8 @@ impl ForwardedPortConnection {
     pub async fn send(&mut self, d: &[u8]) -> Result<(), ()> {
         self.handle
             .data(self.channel, CryptoVec::from_slice(d))
-            .map_err(|_| ())
             .await
+            .map_err(|_| ())
     }
 
     /// Receives data from the connection, returning None when it's closed.
@@ -479,6 +822,7 @@ impl ForwardedPortConnection {
                 channel: self.channel,
                 handle: self.handle,
                 is_write_fut_valid: false,
+                write_len: 0,
                 write_fut: tokio_util::sync::ReusableBoxFuture::new(make_server_write_fut(None)),
             },
             ForwardedPortReader {
@@ -494,6 +838,7 @@ pub struct ForwardedPortWriter {
     channel: russh::ChannelId,
     handle: russh::server::Handle,
     is_write_fut_valid: bool,
+    write_len: usize,
     write_fut: tokio_util::sync::ReusableBoxFuture<'static, Result<(), russh::CryptoVec>>,
 }
 
@@ -515,15 +860,25 @@ impl AsyncWrite for ForwardedPortWriter {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
         if !self.is_write_fut_valid {
             let handle = self.handle.clone();
             let id = self.channel;
-            self.write_fut
-                .set(make_server_write_fut(Some((handle, id, buf.to_vec()))));
+            let write_len = buf.len().min(CHANNEL_WRITE_CHUNK_SIZE);
+            self.write_len = write_len;
+            self.write_fut.set(make_server_write_fut(Some((
+                handle,
+                id,
+                buf[..write_len].to_vec(),
+            ))));
             self.is_write_fut_valid = true;
         }
 
-        self.poll_flush(cx).map(|r| r.map(|_| buf.len()))
+        let write_len = self.write_len;
+        self.poll_flush(cx).map(|r| r.map(|_| write_len))
     }
 
     fn poll_flush(
@@ -542,7 +897,7 @@ impl AsyncWrite for ForwardedPortWriter {
             }
             Poll::Ready(Err(_)) => {
                 self.is_write_fut_valid = false;
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "EOF")))
+                Poll::Ready(Err(io::Error::other("EOF")))
             }
         }
     }
@@ -573,7 +928,7 @@ impl AsyncRead for ForwardedPortReader {
 
         match self.receiver.poll_recv(cx) {
             Poll::Ready(Some(msg)) => self.readbuf.put_data(buf, msg, 0),
-            Poll::Ready(None) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "EOF"))),
+            Poll::Ready(None) => Poll::Ready(Err(io::Error::other("EOF"))),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -655,6 +1010,9 @@ impl Server {
                         Some(cnx) => {
                             if let Some(p) = known_ports.get(&cnx.port) {
                                 p.send(cnx).ok(); // ignore error, could have dropped in the meantime
+                            } else {
+                                log::debug!("rejecting connection to unknown port {}", cnx.port);
+                                cnx.close().await;
                             }
                         },
                         None => {
@@ -840,6 +1198,29 @@ impl russh::server::Handler for ServerHandle {
         Ok((self, true, session))
     }
 
+    async fn channel_open_direct_tcpip(
+        mut self,
+        channel: russh::Channel<russh::server::Msg>,
+        _host_to_connect: &str,
+        port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        session: russh::server::Session,
+    ) -> Result<(Self, bool, russh::server::Session), Self::Error> {
+        let (sender, receiver) = mpsc::channel(10);
+        let txd = self.cnx_tx.send(ForwardedPortConnection {
+            port: port_to_connect,
+            channel: channel.id(),
+            handle: session.handle(),
+            receiver,
+        });
+        if txd.is_ok() {
+            self.channel_senders.insert(channel.id(), sender);
+        }
+
+        Ok((self, true, session))
+    }
+
     async fn data(
         mut self,
         channel: russh::ChannelId,
@@ -933,6 +1314,7 @@ struct AsyncRWChannel {
     readbuf: super::io::ReadBuffer,
 
     is_write_fut_valid: bool,
+    write_len: usize,
     write_fut: tokio_util::sync::ReusableBoxFuture<'static, Result<(), russh::CryptoVec>>,
 }
 
@@ -949,6 +1331,7 @@ impl AsyncRWChannel {
                 incoming: rx,
                 readbuf: super::io::ReadBuffer::default(),
                 is_write_fut_valid: false,
+                write_len: 0,
                 write_fut: tokio_util::sync::ReusableBoxFuture::new(make_client_write_fut(None)),
             },
             tx,
@@ -978,15 +1361,25 @@ impl AsyncWrite for AsyncRWChannel {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
         if !self.is_write_fut_valid {
             let session = self.session.clone();
             let id = self.id;
-            self.write_fut
-                .set(make_client_write_fut(Some((session, id, buf.to_vec()))));
+            let write_len = buf.len().min(CHANNEL_WRITE_CHUNK_SIZE);
+            self.write_len = write_len;
+            self.write_fut.set(make_client_write_fut(Some((
+                session,
+                id,
+                buf[..write_len].to_vec(),
+            ))));
             self.is_write_fut_valid = true;
         }
 
-        self.poll_flush(cx).map(|r| r.map(|_| buf.len()))
+        let write_len = self.write_len;
+        self.poll_flush(cx).map(|r| r.map(|_| write_len))
     }
 
     fn poll_flush(
@@ -1005,7 +1398,7 @@ impl AsyncWrite for AsyncRWChannel {
             }
             Poll::Ready(Err(_)) => {
                 self.is_write_fut_valid = false;
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "EOF")))
+                Poll::Ready(Err(io::Error::other("EOF")))
             }
         }
     }
@@ -1030,21 +1423,21 @@ impl AsyncRead for AsyncRWChannel {
 
         match self.incoming.poll_recv(cx) {
             Poll::Ready(Some(msg)) => self.readbuf.put_data(buf, msg, 0),
-            Poll::Ready(None) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "EOF"))),
+            Poll::Ready(None) => Poll::Ready(Err(io::Error::other("EOF"))),
             Poll::Pending => Poll::Pending,
         }
     }
 }
 
 pub struct RelayHandle {
-    endpoint: TunnelRelayTunnelEndpoint,
+    endpoint: TunnelEndpoint,
     session: Arc<russh::client::Handle<Client>>,
     join: JoinHandle<Result<(), russh::Error>>,
 }
 
 impl RelayHandle {
     /// Gets the endpoint this relay is connected to.
-    pub fn endpoint(&self) -> &TunnelRelayTunnelEndpoint {
+    pub fn endpoint(&self) -> &TunnelEndpoint {
         &self.endpoint
     }
 
@@ -1072,3 +1465,36 @@ impl std::future::Future for RelayHandle {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use russh_keys::key::{KeyPair, SignatureHash};
+
+    /// Regression test for an interop bug where the host advertised RSA
+    /// public keys using `KeyPair::public_key_base64()` (which encodes the
+    /// hash-variant name like "rsa-sha2-256") while the client compared
+    /// against `PublicKey::public_key_base64()` (which always encodes the
+    /// canonical SSH wire name "ssh-rsa"). The two never matched and all
+    /// connections failed with "Unknown server key".
+    #[test]
+    fn encodes_rsa_public_key_in_canonical_ssh_wire_form() {
+        // Generate an RSA keypair with a non-default hash variant — this is
+        // what `RelayTunnelHost::new` does (SHA2_512).
+        let keypair = KeyPair::generate_rsa(2048, SignatureHash::SHA2_512)
+            .expect("generate rsa keypair");
+
+        let advertised = encode_host_public_keys(&keypair);
+        assert_eq!(advertised.len(), 1, "expected exactly one host public key");
+
+        // The advertised key must equal the base64 encoding of the
+        // corresponding `PublicKey` — this is what `RelayTunnelClient`
+        // computes from the server's host key during SSH key exchange.
+        let public_key_b64 = keypair
+            .clone_public_key()
+            .expect("clone public key")
+            .public_key_base64();
+        assert_eq!(advertised[0], public_key_b64);
+    }
+}
+

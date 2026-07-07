@@ -28,14 +28,23 @@ var PpeServiceProperties = TunnelServiceProperties{
 	ServiceURI:           fmt.Sprintf("https://%s/", ppeDnsName),
 	ServiceAppID:         ppeFirstPartyAppID,
 	ServiceInternalAppID: ppeThirdPartyAppID,
-	GitHubAppClientID:    nonProdGitHubAppClientID,
+	GitHubAppClientID:    ppeGitHubAppClientID,
 }
 
 var DevServiceProperties = TunnelServiceProperties{
 	ServiceURI:           fmt.Sprintf("https://%s/", devDnsName),
-	ServiceAppID:         devFirstPartyAppID,
+	ServiceAppID:         devServiceAppID,
 	ServiceInternalAppID: devThirdPartyAppID,
-	GitHubAppClientID:    nonProdGitHubAppClientID,
+	GitHubAppClientID:    devGitHubAppClientID,
+}
+
+// LocalServiceProperties uses the same service app IDs as the development environment,
+// but a different GitHub app with localhost callback URLs.
+var LocalServiceProperties = TunnelServiceProperties{
+	ServiceURI:           fmt.Sprintf("https://%s/", localDnsName),
+	ServiceAppID:         devServiceAppID,
+	ServiceInternalAppID: devThirdPartyAppID,
+	GitHubAppClientID:    localGitHubAppClientID,
 }
 
 type tokenProviderfn func() string
@@ -45,6 +54,7 @@ const (
 	userLimitsApiPath          = "/userlimits"
 	subjectsApiPath            = "/subjects"
 	clustersApiPath            = "/clusters"
+	recommendationsApiSubPath  = "/recommendations"
 	checkNameAvailabilityPath  = ":checkNameAvailability"
 	endpointsApiSubPath        = "/endpoints"
 	portsApiSubPath            = "/ports"
@@ -89,6 +99,7 @@ type Manager struct {
 	additionalHeaders map[string]string
 	userAgents        []UserAgent
 	apiVersion        string
+	isCustomDomain    bool
 }
 
 // Creates a new Manager used for interacting with the Tunnels APIs.
@@ -128,7 +139,21 @@ func NewManager(userAgents []UserAgent, tp tokenProviderfn, tunnelServiceUrl *ur
 		client = httpHandler
 	}
 
-	return &Manager{tokenProvider: tp, httpClient: client, uri: tunnelServiceUrl, userAgents: userAgents, apiVersion: apiVersion}, nil
+	return &Manager{tokenProvider: tp, httpClient: client, uri: tunnelServiceUrl, userAgents: userAgents, apiVersion: apiVersion, isCustomDomain: strings.HasPrefix(tunnelServiceUrl.Hostname(), "cp.")}, nil
+}
+
+// NewManagerForCustomDomain creates a Manager configured for a custom domain.
+// When a custom domain is configured (e.g., "app.github.dev"), control plane calls
+// are routed to "cp.{domain}" and cluster ID hostname manipulation is skipped.
+func NewManagerForCustomDomain(customDomain string, userAgents []UserAgent, tp tokenProviderfn, httpHandler *http.Client, apiVersion string) (*Manager, error) {
+	if customDomain == "" {
+		return nil, fmt.Errorf("custom domain cannot be empty")
+	}
+	serviceUrl, err := url.Parse(fmt.Sprintf("https://cp.%s/", customDomain))
+	if err != nil {
+		return nil, fmt.Errorf("error parsing custom domain URL: %w", err)
+	}
+	return NewManager(userAgents, tp, serviceUrl, httpHandler, apiVersion)
 }
 
 // Lists tunnels owned by the authenticated user.
@@ -205,6 +230,15 @@ func (m *Manager) CreateTunnel(ctx context.Context, tunnel *Tunnel, options *Tun
 		options.AdditionalHeaders = map[string]string{}
 	}
 	options.AdditionalHeaders["If-Not-Match"] = "*"
+
+	// If the caller didn't specify a cluster, auto-select one via the
+	// recommendations API. Failures fall back to global routing.
+	if tunnel.ClusterID == "" {
+		recommendations, recErr := m.GetClusterRecommendations(ctx, "", options.RequiredGeo)
+		if recErr == nil && recommendations != nil && recommendations.RecommendedClusterID != "" {
+			tunnel.ClusterID = recommendations.RecommendedClusterID
+		}
+	}
 
 	convertedTunnel, err := tunnel.requestObject()
 	convertedTunnel.TunnelID = tunnel.TunnelID
@@ -681,6 +715,35 @@ func (m *Manager) ListClusters(ctx context.Context) (clusters []*ClusterDetails,
 	return clusters, nil
 }
 
+// Gets cluster recommendations for tunnel creation based on capacity and availability.
+// preferredClusterId and requiredGeo are optional; pass an empty string to omit them.
+func (m *Manager) GetClusterRecommendations(
+	ctx context.Context, preferredClusterId string, requiredGeo string,
+) (recommendations *ClusterRecommendationResponse, err error) {
+	queryValues := url.Values{}
+	if preferredClusterId != "" {
+		queryValues.Set("preferredClusterId", preferredClusterId)
+	}
+	if requiredGeo != "" {
+		queryValues.Set("requiredGeo", requiredGeo)
+	}
+
+	path := clustersApiPath + recommendationsApiSubPath
+	url := m.buildUri("", path, nil, queryValues.Encode())
+	response, err := m.sendRequest(ctx, http.MethodGet, url, nil, nil, "", false)
+
+	if err != nil {
+		return nil, fmt.Errorf("error getting cluster recommendations: %w", err)
+	}
+
+	err = json.Unmarshal(response, &recommendations)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing response json to ClusterRecommendationResponse: %w", err)
+	}
+
+	return recommendations, nil
+}
+
 // Checks if tunnel name is available
 // Returns true if name is available
 func (m *Manager) CheckNameAvailability(
@@ -870,8 +933,11 @@ func (m *Manager) getAccessToken(tunnel *Tunnel, tunnelRequestOptions *TunnelReq
 }
 
 func (m *Manager) buildUri(clusterId string, path string, options *TunnelRequestOptions, query string) *url.URL {
-	baseAddress := m.uri
-	if clusterId != "" {
+	// Copy the URL by value so that mutations below (Host, Path, RawQuery) do
+	// not corrupt the shared manager URI (m.uri is a pointer).
+	baseAddressValue := *m.uri
+	baseAddress := &baseAddressValue
+	if clusterId != "" && !m.isCustomDomain {
 		// tunnels.local.api.visualstudio.com resolves to localhost (for local development).
 		if baseAddress.Host != "localhost" &&
 			baseAddress.Host != "tunnels.local.api.visualstudio.com" &&

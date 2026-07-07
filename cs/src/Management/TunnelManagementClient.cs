@@ -42,6 +42,7 @@ namespace Microsoft.DevTunnels.Management
         private const string EventsApiSubPath = "/events";
         private const string ClustersApiPath = "/clusters";
         private const string ClustersV1ApiPath = ApiV1Path + "/clusters";
+        private const string RecommendationsSubPath = "/recommendations";
         private const string TunnelAuthenticationScheme = "Tunnel";
         private const string RequestIdHeaderName = "VsSaaS-Request-Id";
         private const string CheckAvailableSubPath = ":checkNameAvailability";
@@ -89,6 +90,7 @@ namespace Microsoft.DevTunnels.Management
 
         private readonly HttpClient httpClient;
         private readonly Func<Task<AuthenticationHeaderValue?>> userTokenCallback;
+        private readonly bool isCustomDomain;
 
         private class EventInfo
         {
@@ -223,6 +225,8 @@ namespace Microsoft.DevTunnels.Management
                     $"Invalid tunnel service URI: {tunnelServiceUri}", nameof(tunnelServiceUri));
             }
 
+            this.isCustomDomain = tunnelServiceUri.Host.StartsWith("cp.");
+
             // The `SocketsHttpHandler` or `HttpClientHandler` automatic redirection is disabled
             // because they do not keep the Authorization header when redirecting. This handler
             // will keep all headers when redirecting, and also supports switching the behavior
@@ -233,6 +237,33 @@ namespace Microsoft.DevTunnels.Management
             {
                 BaseAddress = tunnelServiceUri,
             };
+        }
+
+        /// <summary>
+        /// Creates a <see cref="TunnelManagementClient"/> configured for a custom domain.
+        /// </summary>
+        /// <remarks>
+        /// When a custom domain is configured (e.g., "app.github.dev"), control plane calls
+        /// are routed to "cp.{domain}" and cluster ID hostname manipulation is skipped
+        /// because routing is handled at the infrastructure level.
+        /// </remarks>
+        /// <param name="customDomain">The custom domain (e.g., "app.github.dev").</param>
+        /// <param name="userAgents">User agents.</param>
+        /// <param name="userTokenCallback">Optional authentication callback.</param>
+        /// <param name="httpHandler">Optional HTTP handler.</param>
+        /// <param name="apiVersion">API version.</param>
+        /// <returns>A configured <see cref="TunnelManagementClient"/> instance.</returns>
+        public static TunnelManagementClient ForCustomDomain(
+            string customDomain,
+            ProductInfoHeaderValue[] userAgents,
+            Func<Task<AuthenticationHeaderValue?>>? userTokenCallback = null,
+            HttpMessageHandler? httpHandler = null,
+            ManagementApiVersions apiVersion = DefaultApiVersion)
+        {
+            Requires.NotNullOrEmpty(customDomain, nameof(customDomain));
+            var serviceUri = new Uri($"https://cp.{customDomain}/");
+            return new TunnelManagementClient(
+                userAgents, userTokenCallback, serviceUri, httpHandler, apiVersion);
         }
 
         /// <summary>
@@ -836,7 +867,7 @@ namespace Microsoft.DevTunnels.Management
             var baseAddress = this.httpClient.BaseAddress!;
             var builder = new UriBuilder(baseAddress);
 
-            if (baseAddress.HostNameType == UriHostNameType.Dns)
+            if (baseAddress.HostNameType == UriHostNameType.Dns && !this.isCustomDomain)
             {
                 builder.Host = ReplaceTunnelServiceHostnameClusterId(builder.Host, clusterId);
             }
@@ -1054,6 +1085,29 @@ namespace Microsoft.DevTunnels.Management
         {
             Requires.NotNull(tunnel, nameof(tunnel));
             options ??= new TunnelRequestOptions();
+
+            // If the caller didn't specify a cluster, auto-select one via the
+            // recommendations API. Failures fall back to global routing.
+            if (string.IsNullOrEmpty(tunnel.ClusterId))
+            {
+                try
+                {
+                    var recommendations = await GetClusterRecommendationsAsync(
+                        preferredClusterId: null,
+                        requiredGeo: options.RequiredGeo,
+                        cancellation);
+                    if (!string.IsNullOrEmpty(recommendations?.RecommendedClusterId))
+                    {
+                        tunnel.ClusterId = recommendations!.RecommendedClusterId;
+                    }
+                }
+                catch (Exception) when (!cancellation.IsCancellationRequested)
+                {
+                    // Fall through to global (Traffic Manager) routing if the
+                    // recommendations request fails for any reason.
+                }
+            }
+
             options.AdditionalHeaders ??= new List<KeyValuePair<string, string>>();
             options.AdditionalHeaders = options.AdditionalHeaders.Append(
                 new KeyValuePair<string, string>("If-None-Match", "*"));
@@ -1563,6 +1617,46 @@ namespace Microsoft.DevTunnels.Management
                 body: null,
                 cancellation);
             return clusterDetails!;
+        }
+
+        /// <inheritdoc/>
+        public async Task<ClusterRecommendationResponse> GetClusterRecommendationsAsync(
+            string? preferredClusterId = null,
+            string? requiredGeo = null,
+            CancellationToken cancellation = default)
+        {
+            var baseAddress = this.httpClient.BaseAddress!;
+            var builder = new UriBuilder(baseAddress);
+            builder.Path = ClustersPath + RecommendationsSubPath;
+
+            var queryParts = new List<string>();
+            var apiQuery = GetApiQuery();
+            if (!string.IsNullOrEmpty(apiQuery))
+            {
+                queryParts.Add(apiQuery!);
+            }
+
+            if (!string.IsNullOrEmpty(preferredClusterId))
+            {
+                queryParts.Add(
+                    $"preferredClusterId={Uri.EscapeDataString(preferredClusterId!)}");
+            }
+
+            if (!string.IsNullOrEmpty(requiredGeo))
+            {
+                queryParts.Add($"requiredGeo={Uri.EscapeDataString(requiredGeo!)}");
+            }
+
+            builder.Query = string.Join("&", queryParts);
+
+            var response = await SendRequestAsync<object, ClusterRecommendationResponse>(
+                HttpMethod.Get,
+                builder.Uri,
+                options: null,
+                authHeader: null,
+                body: null,
+                cancellation);
+            return response!;
         }
 
         /// <inheritdoc/>

@@ -13,6 +13,7 @@ import {
     ProblemDetails,
     TunnelServiceProperties,
     ClusterDetails,
+    ClusterRecommendationResponse,
     NamedRateStatus,
     TunnelListByRegionResponse,
     TunnelPortListResponse,
@@ -41,6 +42,7 @@ const endpointsApiSubPath = '/endpoints';
 const portsApiSubPath = '/ports';
 const eventsApiSubPath = '/events';
 const clustersApiPath = '/clusters';
+const recommendationsSubPath = '/recommendations';
 const tunnelAuthentication = 'Authorization';
 const checkAvailablePath = ':checkNameAvailability';
 const createNameRetries = 3;
@@ -129,6 +131,7 @@ export class TunnelManagementHttpClient implements TunnelManagementClient {
     private readonly baseAddress: string;
     private readonly userTokenCallback: () => Promise<string | null>;
     private readonly userAgents: string;
+    private readonly isCustomDomain: boolean;
 
     private readonly reportProgressEmitter = new Emitter<TunnelReportProgressEventArgs>();
 
@@ -243,6 +246,37 @@ export class TunnelManagementHttpClient implements TunnelManagementClient {
         }
 
         this.baseAddress = tunnelServiceUri;
+        this.isCustomDomain = new URL(tunnelServiceUri).hostname.startsWith('cp.');
+    }
+
+    /**
+     * Creates a `TunnelManagementHttpClient` configured for a custom domain.
+     *
+     * When a custom domain is configured (e.g., "app.github.dev"), control plane calls
+     * are routed to "cp.{domain}" and cluster ID hostname manipulation is skipped
+     * because routing is handled at the infrastructure level.
+     *
+     * @param customDomain The custom domain (e.g., "app.github.dev").
+     * @param userAgents User agent(s).
+     * @param apiVersion API version.
+     * @param userTokenCallback Optional authentication callback.
+     * @param httpsAgent Optional HTTPS agent.
+     * @param adapter Optional axios adapter.
+     */
+    public static forCustomDomain(
+        customDomain: string,
+        userAgents: (ProductHeaderValue | string)[] | ProductHeaderValue | string,
+        apiVersion: ManagementApiVersions,
+        userTokenCallback?: () => Promise<string | null>,
+        httpsAgent?: https.Agent,
+        adapter?: AxiosAdapter,
+    ): TunnelManagementHttpClient {
+        if (!customDomain) {
+            throw new TypeError('Custom domain must be a non-empty string.');
+        }
+        const serviceUri = `https://cp.${customDomain}/`;
+        return new TunnelManagementHttpClient(
+            userAgents, apiVersion, userTokenCallback, serviceUri, httpsAgent, adapter);
     }
 
     public async listTunnels(
@@ -296,6 +330,25 @@ export class TunnelManagementHttpClient implements TunnelManagementClient {
         const tunnelId = tunnel.tunnelId;
         const idGenerated = tunnelId === undefined || tunnelId === null || tunnelId === '';
         options = options || {};
+
+        // If the caller didn't specify a cluster, auto-select one via the
+        // recommendations API. Failures fall back to global routing.
+        if (!tunnel.clusterId) {
+            try {
+                const recommendations = await this.getClusterRecommendations(
+                    undefined,
+                    options.requiredGeo,
+                    cancellation,
+                );
+                if (recommendations?.recommendedClusterId) {
+                    tunnel.clusterId = recommendations.recommendedClusterId;
+                }
+            } catch {
+                // Fall through to global (Traffic Manager) routing if the
+                // recommendations request fails for any reason.
+            }
+        }
+
         options.additionalHeaders = options.additionalHeaders || {};
         options.additionalHeaders['If-Not-Match'] = "*";
 
@@ -665,6 +718,32 @@ export class TunnelManagementHttpClient implements TunnelManagementClient {
         ))!;
     }
 
+    public async getClusterRecommendations(
+        preferredClusterId?: string,
+        requiredGeo?: string,
+        cancellation?: CancellationToken,
+    ): Promise<ClusterRecommendationResponse> {
+        const queryParts: string[] = [];
+        if (preferredClusterId) {
+            queryParts.push(`preferredClusterId=${encodeURIComponent(preferredClusterId)}`);
+        }
+        if (requiredGeo) {
+            queryParts.push(`requiredGeo=${encodeURIComponent(requiredGeo)}`);
+        }
+        const query = queryParts.length > 0 ? queryParts.join('&') : undefined;
+
+        return (await this.sendRequest<ClusterRecommendationResponse>(
+            'GET',
+            undefined,
+            clustersApiPath + recommendationsSubPath,
+            query,
+            undefined,
+            undefined,
+            false,
+            cancellation,
+        ))!;
+    }
+
     /**
      * Sends an HTTP request to the tunnel management API, targeting a specific tunnel.
      * This protected method enables subclasses to support additional tunnel management APIs.
@@ -959,7 +1038,7 @@ export class TunnelManagementHttpClient implements TunnelManagementClient {
             }
         }
         let baseAddress = this.baseAddress;
-        if (clusterId) {
+        if (clusterId && !this.isCustomDomain) {
             const url = new URL(baseAddress);
             const portNumber = parseInt(url.port, 10);
 
